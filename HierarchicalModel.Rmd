@@ -1,0 +1,381 @@
+---
+title: "Hierarchical Model"
+output: pdf_document
+---
+First we simulate a dataset with underlying hierarchical structure
+```{r dataset}
+set.seed(111)
+# define the number of individuals and features
+n_id <- 300
+p <- 20
+
+# randomly define the number of measurements for different individuals
+times <- sample(5:15, n_id, replace = TRUE)
+# generate id sequence
+id <- rep(1:n_id, times = times)
+N <- length(id)
+
+# generate covariance matrix
+X <- matrix(rnorm(N * p), nrow = N, ncol = p)
+colnames(X) <- paste0("x", 1:p)
+
+# define the underlying true beta and id-specific standard deviation
+beta_true <- c(1.9, -0.9, 0.4, 2.1, -1.1, rep(0, p - 5))
+alpha_true <- 0 # explicitly define the intercept
+sigma_b_true <- 1
+
+# randomly generate id-specific contribution
+b_true <- rnorm(n_id, mean = 0, sd = sigma_b_true)
+
+# calculate the Bernoulli probability and generate y
+eta <- alpha_true + as.vector(X %*% beta_true) + b_true[id]
+p_true <- 1 / (1 + exp(-eta))
+y <- rbinom(n = N, size = 1, prob = p_true)
+
+# store the values
+dat <- data.frame(
+  id = id,
+  y = y,
+  X
+)
+
+truth <- list(
+  alpha_true = alpha_true,
+  beta_true = beta_true,
+  b_true = b_true,
+  sigma_b_true = sigma_b_true,
+  p_true = p_true,
+  eta_true = eta
+)
+
+
+head(dat)
+```
+Then we perform MH
+```{r MH}
+# log likelihood
+loglik_hier <- function(beta, z, b, X, y, id) {
+  eta <- as.vector(X %*% (beta * z) + b[id])
+  # simplified expression
+  sum(y * eta - log1p(exp(eta)))
+}
+
+# log posterior
+logpost_beta <- function(beta, z, b, X, y, id, sigma0 = 100) {
+  loglik <- loglik_hier(beta, z, b, X, y, id)
+  logprior <- -0.5 * sum(beta^2 / sigma0^2)
+  loglik + logprior
+}
+
+# a single update for beta
+mh_update_beta <- function(beta_curr, z_curr, b_curr,
+                           X, y, id,
+                           sigma0 = 100,
+                           tau_beta = 0.05) {
+  p <- length(beta_curr)
+  beta_prop <- rnorm(p, mean = beta_curr, sd = tau_beta)
+
+  logpi_curr <- logpost_beta(beta_curr, z_curr, b_curr, X, y, id, sigma0)
+  logpi_prop <- logpost_beta(beta_prop, z_curr, b_curr, X, y, id, sigma0)
+  # acceptance probability
+  log_alpha <- logpi_prop - logpi_curr
+
+  if (log(runif(1)) < log_alpha) {
+    return(beta_prop)   # accept
+  } else {
+    return(beta_curr)   # reject
+  }
+}
+
+# log posterior for b
+logpost_b <- function(b, beta, z, X, y, id, sigma2_b) {
+  loglik  <- loglik_hier(beta, z, b, X, y, id)
+  # independent prior for each b_k
+  logprior <- sum(dnorm(b, mean = 0, sd = sqrt(sigma2_b), log = TRUE))
+  loglik + logprior
+}
+
+# a single update for b
+mh_update_b <- function(b_curr, beta_curr, z_curr,
+                        X, y, id, n_id,
+                        sigma2_b,
+                        tau_b = 0.1) {
+  b_new <- b_curr
+  # store the times of acceptance
+  acc_vec <- integer(n_id)
+
+  for (k in sample.int(n_id)) {
+    bk_curr <- b_new[k]
+    bk_prop <- rnorm(1, mean = bk_curr, sd = tau_b)
+    b_prop <- b_new
+    b_prop[k] <- bk_prop
+
+    logpi_curr <- logpost_b(b_new, beta_curr, z_curr, X, y, id, sigma2_b)
+    logpi_prop <- logpost_b(b_prop, beta_curr, z_curr, X, y, id, sigma2_b)
+
+    # log acceptance prob
+    log_alpha <- logpi_prop - logpi_curr
+
+    if (log(runif(1)) < log_alpha) {
+      b_new[k]  <- bk_prop
+      acc_vec[k] <- acc_vec[k] + 1
+    }
+  }
+
+  list(b = b_new, acc = acc_vec)
+}
+
+# a single update for sigma(conjugate)
+update_sigma2_b <- function(b_curr, a0 = 0.001, b0 = 0.001) {
+  n_id  <- length(b_curr)
+  a_post <- a0 + n_id / 2
+  b_post <- b0 + 0.5 * sum(b_curr^2)
+  1 / rgamma(1, shape = a_post, rate = b_post)
+}
+
+# a single update for z
+flip_z_hier <- function(z_curr, beta_curr, b_curr, X, y, id) {
+  p <- length(z_curr)
+  
+  # log-likelihood as a function of z
+  loglik_given_z <- function(z_vec) {
+    loglik_hier(beta = beta_curr, z = z_vec, b = b_curr,
+                X = X, y = y, id = id)
+  }
+  
+  for (j in sample.int(p)) {
+    # compute the full conditional probability
+    z0 <- z_curr; z0[j] <- 0
+    z1 <- z_curr; z1[j] <- 1
+    
+    ll0 <- loglik_given_z(z0)
+    ll1 <- loglik_given_z(z1)
+    
+    log_odds <- ll1 - ll0
+    p1 <- plogis(log_odds)
+    # sample z_j from Bern
+    z_curr[j] <- rbinom(1, size = 1, prob = p1)
+  }
+  
+  return(z_curr)
+}
+
+run_mcmc_hier <- function(X, y, id, sigma0 = 100,
+                          n_iter = 5000, burn_in = 1000,
+                          tau_beta = 0.05, tau_b = 0.10,
+                          a0 = 0.001, b0 = 0.001) {
+  set.seed(111)
+
+  N <- nrow(X)
+  p <- ncol(X)
+  n_id <- max(id)
+
+  # initialization
+  beta_curr <- rep(0, p)
+  z_curr <- rep(1, p)
+  sigma2_b <- 1
+  b_curr <- rnorm(n_id, 0, sqrt(sigma2_b))
+
+  # matrices to store samples
+  B_save <- matrix(NA, nrow = n_iter, ncol = p)
+  Z_save <- matrix(NA, nrow = n_iter, ncol = p)
+  sigma2_b_save <- numeric(n_iter)
+
+  # to store the number of accept
+  acc_beta <- 0
+  acc_b    <- integer(n_id)
+
+  for (iter in 1:n_iter) {
+
+    # update beta
+    beta_new <- mh_update_beta(beta_curr, z_curr, b_curr,
+                               X, y, id,
+                               sigma0 = sigma0,
+                               tau_beta = tau_beta)
+    if (!all(beta_new == beta_curr)) acc_beta <- acc_beta + 1
+    beta_curr <- beta_new
+
+    # update b
+    tmp_b <- mh_update_b(b_curr, beta_curr, z_curr,
+                         X, y, id, n_id,
+                         sigma2_b = sigma2_b,
+                         tau_b = tau_b)
+    b_curr <- tmp_b$b
+    acc_b <- acc_b + tmp_b$acc
+
+    # update sigma_b^2
+    sigma2_b <- update_sigma2_b(b_curr, a0 = a0, b0 = b0)
+
+    # update z
+    z_curr <- flip_z_hier(z_curr, beta_curr, b_curr, X, y, id)
+
+    B_save[iter, ] <- beta_curr
+    Z_save[iter, ] <- z_curr
+    sigma2_b_save[iter] <- sigma2_b
+
+    if (iter %% 1000 == 0) {
+      cat("iter =", iter, "/", n_iter, "\n")
+    }
+  }
+
+  keep <- (burn_in + 1):n_iter
+
+  list(
+    B = B_save[keep, , drop = FALSE],
+    Z = Z_save[keep, , drop = FALSE],
+    sigma2_b = sigma2_b_save[keep],
+    acc_rate_beta = acc_beta / n_iter,
+    acc_rate_b = acc_b / n_iter
+  )
+}
+
+res_hier <- run_mcmc_hier(X, y, id,
+                          n_iter = 10000,
+                          burn_in = 2000)
+
+res_hier$acc_rate_beta
+mean(res_hier$acc_rate_b)
+
+pip_hier <- colMeans(res_hier$Z)
+colMeans(res_hier$B)
+```
+
+Now we perform PG
+```{r PG}
+library(BayesLogit)
+library(MASS)
+
+# update (omega, beta, b) by PG, given z and sigma2_b
+pg_update_beta_b <- function(beta_curr, b_curr, z_curr,
+                             X, Z_mat, y, sigma0 = 100, sigma2_b) {
+  n    <- nrow(X)
+  p    <- ncol(X)
+  n_id <- ncol(Z_mat)
+
+  # construct the prior precision matrix
+  prec_beta <- rep(1 / sigma0^2, p)
+  prec_b    <- rep(1 / sigma2_b, n_id)
+  Sigma0_inv <- diag(c(prec_beta, prec_b))
+
+  # sample latent variable
+  beta_eff <- beta_curr * z_curr
+  eta      <- as.vector(X %*% beta_eff + Z_mat %*% b_curr)
+  omega    <- BayesLogit::rpg(num = n, h = 1, z = eta)
+
+  # compute the corresponding values for sampling coefs
+  kappa <- y - 0.5
+  X_z     <- sweep(X, 2, z_curr, "*")
+  X_tilde <- cbind(X_z, Z_mat)
+  WX    <- X_tilde * omega
+  XtWX  <- t(X_tilde) %*% WX
+  V_om  <- solve(XtWX + Sigma0_inv)
+  m_om  <- V_om %*% (t(X_tilde) %*% kappa)
+
+  # sample from MVN
+  theta_new <- as.vector(
+    MASS::mvrnorm(1, mu = as.vector(m_om), Sigma = V_om)
+  )
+  beta_new <- theta_new[1:p]
+  b_new    <- theta_new[(p + 1):(p + n_id)]
+
+  list(beta = beta_new, b = b_new)
+}
+
+
+run_mcmc_pg_hier <- function(X, y, id,
+                             sigma0  = 100,
+                             n_iter  = 5000,
+                             burn_in = 1000,
+                             a0 = 0.001, b0 = 0.001) {
+  set.seed(111)
+
+  n <- nrow(X)
+  p <- ncol(X)
+  n_id <- max(id)
+
+  # design matrix for random intercepts
+  Z_mat <- model.matrix(~ factor(id) - 1)
+
+  # initialization
+  beta_curr <- rep(0, p)
+  z_curr <- rep(1, p)
+  sigma2_b <- 1
+  b_curr <- rnorm(n_id, 0, sqrt(sigma2_b))
+
+  # store samples
+  B_save <- matrix(NA, nrow = n_iter, ncol = p)
+  Z_save <- matrix(NA, nrow = n_iter, ncol = p)
+  sigma2_b_save <- numeric(n_iter)
+
+  for (iter in 1:n_iter) {
+
+    # (omega, beta, b) block via PG
+    theta_new <- pg_update_beta_b(beta_curr, b_curr, z_curr,
+                                  X, Z_mat, y,
+                                  sigma0  = sigma0,
+                                  sigma2_b = sigma2_b)
+    beta_curr <- theta_new$beta
+    b_curr <- theta_new$b
+
+    # update sigma_b^2
+    sigma2_b <- update_sigma2_b(b_curr, a0 = a0, b0 = b0)
+
+    # update z
+    z_curr <- flip_z_hier(z_curr, beta_curr, b_curr, X, y, id)
+
+    # save
+    B_save[iter, ] <- beta_curr
+    Z_save[iter, ] <- z_curr
+    sigma2_b_save[iter] <- sigma2_b
+
+    if (iter %% 1000 == 0) {
+      cat("iter =", iter, "/", n_iter, "\n")
+    }
+  }
+
+  keep <- (burn_in + 1):n_iter
+
+  list(
+    B = B_save[keep, , drop = FALSE],
+    Z = Z_save[keep, , drop = FALSE],
+    sigma2_b = sigma2_b_save[keep]
+  )
+}
+
+res_pg_hier <- run_mcmc_pg_hier(X, y, id,
+                                n_iter  = 10000,
+                                burn_in = 2000)
+
+colMeans(res_pg_hier$Z)
+colMeans(res_pg_hier$B)
+```
+```{r jags}
+model_hier <- "
+model {
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    p[i] <- 1 / (1 + exp(-eta[i]))
+    eta[i] <- inprod(X[i,], beta_eff[]) + b[id[i]]
+  }
+
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0.0, 1.0E-4)
+    z[j] ~ dbern(0.5)
+    beta_eff[j] <- z[j] * beta[j]
+  }
+
+  for (k in 1:n_id) {
+    b[k] ~ dnorm(0.0, tau_b)
+  }
+
+  tau_b ~ dgamma(0.001, 0.001)
+  sigma_b <- 1 / sqrt(tau_b)
+}
+"
+library(rjags)
+jm <- jags.model(textConnection(model_hier), data = list(N = nrow(X), P = ncol(X), y=y, X=X, id=id, n_id=n_id))
+update(jm, 2000) # burnin
+cs <- coda.samples(jm, c('beta', 'z'), 10000)
+s <- as.data.frame(cs[[1]])
+```
+
