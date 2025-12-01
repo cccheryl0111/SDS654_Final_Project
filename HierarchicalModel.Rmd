@@ -23,6 +23,7 @@ colnames(X) <- paste0("x", 1:p)
 beta_true <- c(1.9, -0.9, 0.4, 2.1, -1.1, rep(0, p - 5))
 alpha_true <- 0 # explicitly define the intercept
 sigma_b_true <- 1
+Z_true <- c(rep(1, 5), rep(0, p - 5))
 
 # randomly generate id-specific contribution
 b_true <- rnorm(n_id, mean = 0, sd = sigma_b_true)
@@ -228,16 +229,51 @@ run_mcmc_hier <- function(X, y, id, sigma0 = 100,
     acc_rate_b = acc_b / n_iter
   )
 }
+```
 
-res_hier <- run_mcmc_hier(X, y, id,
-                          n_iter = 10000,
-                          burn_in = 2000)
+```{r MHrun}
+library(coda)
 
-res_hier$acc_rate_beta
-mean(res_hier$acc_rate_b)
+t_mh <- system.time(
+  res_hier <- run_mcmc_hier(X, y, id, n_iter = 15000, burn_in = 5000)
+)
 
-pip_hier <- colMeans(res_hier$Z)
-colMeans(res_hier$B)
+t_mh["elapsed"]
+
+# extract the result
+beta_mh <- res_hier$B
+Z_mh <- res_hier$Z
+beta_eff_mh <- beta_mh * Z_mh
+
+ess_beta_mh <- effectiveSize(as.mcmc(beta_eff_mh))
+hist(ess_beta_mh, main = "ESS for beta in hierarchical model by MH", xlab = "ESS")
+
+# compute 95% credible interval coverage for beta
+CI_beta_mh <- apply(beta_eff_mh, 2, quantile, c(0.025, 0.975))
+in_CI_beta_mh <- (beta_true >= CI_beta_mh[1, ]) & (beta_true <= CI_beta_mh[2, ])
+mean(in_CI_beta_mh)  # coverage of beta
+
+# compute 95% credible interval coverage for sigma
+CI_sigma_mh <- quantile(res_hier$sigma2_b, c(0.025, 0.975))
+in_CI_sigma_mh <- (sigma_b_true^2 >= CI_sigma_mh[1]) & (sigma_b_true^2 <= CI_sigma_mh[2])
+in_CI_sigma_mh
+
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_mh)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
 ```
 
 Now we perform PG
@@ -342,13 +378,50 @@ run_mcmc_pg_hier <- function(X, y, id,
   )
 }
 
-res_pg_hier <- run_mcmc_pg_hier(X, y, id,
-                                n_iter  = 10000,
-                                burn_in = 2000)
-
-colMeans(res_pg_hier$Z)
-colMeans(res_pg_hier$B)
 ```
+
+```{r PGrun}
+t_pg <- system.time(
+  res_pg_hier <- run_mcmc_pg_hier(X, y, id, n_iter  = 15000, burn_in = 5000)
+)
+
+t_pg["elapsed"]
+
+# extract the result
+beta_pg <- res_pg_hier$B
+Z_pg <- res_pg_hier$Z
+beta_eff_pg <- beta_pg * Z_pg
+
+ess_beta_pg <- effectiveSize(as.mcmc(beta_eff_pg))
+hist(ess_beta_pg, main = "ESS for beta in hierarchical model by PG", xlab = "ESS")
+
+# compute 95% credible interval coverage for beta
+CI_beta_pg <- apply(beta_eff_pg, 2, quantile, c(0.025, 0.975))
+in_CI_beta_pg <- (beta_true >= CI_beta_pg[1, ]) & (beta_true <= CI_beta_pg[2, ])
+mean(in_CI_beta_pg)  # coverage of beta
+
+# compute 95% credible interval coverage for sigma
+CI_sigma_pg <- quantile(res_pg_hier$sigma2_b, c(0.025, 0.975))
+in_CI_sigma_pg <- (sigma_b_true^2 >= CI_sigma_pg[1]) & (sigma_b_true^2 <= CI_sigma_pg[2])
+in_CI_sigma_pg
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_pg)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
+```
+
 ```{r jags}
 model_hier <- "
 model {
@@ -372,10 +445,50 @@ model {
   sigma_b <- 1 / sqrt(tau_b)
 }
 "
-library(rjags)
-jm <- jags.model(textConnection(model_hier), data = list(N = nrow(X), P = ncol(X), y=y, X=X, id=id, n_id=n_id))
-update(jm, 2000) # burnin
-cs <- coda.samples(jm, c('beta', 'z'), 10000)
-s <- as.data.frame(cs[[1]])
 ```
 
+```{r JAGSrun}
+library(rjags)
+t_jags <- system.time({
+  jm <- jags.model(textConnection(model_hier), data = list(N = nrow(X), P = ncol(X), y=y, X=X, id=id, n_id=n_id))
+  update(jm, 5000) # burnin
+  cs <- coda.samples(jm, c('beta', 'z', 'sigma_b'), 10000)
+  s <- as.data.frame(cs[[1]])
+})
+
+t_jags["elapsed"]
+
+beta_jags <- s[, 1:20]
+Z_jags <- s[, 21:40]
+beta_eff_jags <- beta_jags * Z_jags
+
+# compute the effective sample size
+ess_beta_jags <- effectiveSize(as.mcmc(beta_eff_jags))
+hist(ess_beta_jags, main = "ESS for beta by JAGS", xlab = "ESS")
+
+# compute 95% credible interval of beta
+CI_beta_jags <- apply(beta_eff_jags, 2, quantile, c(0.025, 0.975))
+in_CI_beta_jags <- (beta_true >= CI_beta_jags[1, ]) & (beta_true <= CI_beta_jags[2, ])
+mean(in_CI_beta_jags)  # coverage of beta
+
+# compute 95% credible interval coverage for sigma
+CI_sigma_jags <- quantile(s[,41], c(0.025, 0.975))
+in_CI_sigma_jags <- (sigma_b_true >= CI_sigma_jags[1]) & (sigma_b_true <= CI_sigma_jags[2])
+in_CI_sigma_jags
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_jags)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
+```

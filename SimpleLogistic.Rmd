@@ -20,8 +20,9 @@ for (j in 1:p) {
 colnames(X) <- paste0("x", 1:p)
 
 # Set the underlying true beta
-beta_true <- c(1.9, -0.9, 0.4, 2.1, -1.1, rep(0, p - 5))
+beta_true <- c(1.9, -0.9, 0.4, 2.1, -1.1, rep(0, p-5))
 intercept_true <- 0 # set beta0 individually as we did not define the all-one column in X
+Z_true <- c(rep(1, 5), rep(0, p-5))
 
 # Construct the logistic model
 eta <- as.vector(intercept_true + X %*% beta_true)
@@ -178,15 +179,46 @@ run_mcmc <- function(X, y,
     proposal = prop
   )
 }
+```
 
 
-res <- run_mcmc(X, y, n_iter = 100000, burn_in  = 10000)
+```{r indepMHrun}
+library(coda)
 
+t_mh <- system.time(
+  res <- run_mcmc(X, y, n_iter = 15000, burn_in = 5000)
+)
 
-colMeans(res$Z)
-colMeans(res$B)
-res$acc_rate_b
+t_mh["elapsed"]
 
+# extract the result
+beta_mh <- res$B
+Z_mh <- res$Z
+beta_eff_mh <- beta_mh * Z_mh
+
+ess_beta_mh <- effectiveSize(as.mcmc(beta_eff_mh))
+hist(ess_beta_mh, main = "ESS for beta by MH", xlab = "ESS")
+
+# compute 95% credible interval coverage for beta
+CI_beta_mh <- apply(beta_eff_mh, 2, quantile, c(0.025, 0.975))
+in_CI_beta_mh <- (beta_true >= CI_beta_mh[1, ]) & (beta_true <= CI_beta_mh[2, ])
+mean(in_CI_beta_mh)  # coverage of beta
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_mh)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
 ```
 
 Now we perform the P\'olya-Gamma Data Augmentation
@@ -257,12 +289,46 @@ run_mcmc_pg <- function(X, y,
     Z = Z_save[(burn_in + 1):n_iter, , drop = FALSE]
   )
 }
+```
 
-res_pg <- run_mcmc_pg(X, y, n_iter = 100000, burn_in  = 10000)
 
+```{r PGrun}
+library(coda)
 
-colMeans(res_pg$Z)
-colMeans(res_pg$B)
+t_pg <- system.time(
+  res_pg <- run_mcmc_pg(X, y, n_iter = 15000, burn_in  = 5000)
+)
+
+t_pg["elapsed"]
+
+# extract the result
+beta_pg <- res_pg$B
+Z_pg <- res_pg$Z
+beta_eff_pg <- beta_pg * Z_pg
+
+ess_beta_pg <- effectiveSize(as.mcmc(beta_eff_pg))
+hist(ess_beta_pg, main = "ESS for beta by PG", xlab = "ESS")
+
+# compute 95% credible interval coverage for beta
+CI_beta_pg <- apply(beta_eff_pg, 2, quantile, c(0.025, 0.975))
+in_CI_beta_pg <- (beta_true >= CI_beta_pg[1, ]) & (beta_true <= CI_beta_pg[2, ])
+mean(in_CI_beta_pg)  # coverage of beta
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_pg)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)
+FPR <- FP / (FP + TN)
+
+TPR
+FPR
 ```
 
 Now we move on to compute JAGS
@@ -285,11 +351,45 @@ model {
 
 }
 "
-library(rjags)
-jm <- jags.model(textConnection(model), data = list(N = nrow(X), P = ncol(X), y=y, X=X))
-update(jm, 10000) # burnin
-cs <- coda.samples(jm, c('beta', 'z'), 100000)
-s <- as.data.frame(cs[[1]])
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r jagsrun}
+library(rjags)
+t_jags <- system.time({
+  jm <- jags.model(textConnection(model), data = list(N = nrow(X), P = ncol(X), y=y, X=X))
+  update(jm, 5000) # burnin
+  cs <- coda.samples(jm, c('beta', 'z'), 10000)
+  s <- as.data.frame(cs[[1]])
+})
+
+t_jags["elapsed"]
+
+beta_jags <- s[, 1:20]
+Z_jags <- s[, 21:40]
+beta_eff_jags <- beta_jags * Z_jags
+
+# compute the effective sample size
+ess_beta_jags <- effectiveSize(as.mcmc(beta_eff_jags))
+hist(ess_beta_jags, main = "ESS for beta by JAGS", xlab = "ESS")
+
+# compute 95% credible interval of beta
+CI_beta_jags <- apply(beta_eff_jags, 2, quantile, c(0.025, 0.975))
+in_CI_beta_jags <- (beta_true >= CI_beta_jags[1, ]) & (beta_true <= CI_beta_jags[2, ])
+mean(in_CI_beta_jags)  # coverage of beta
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_jags)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
+```
