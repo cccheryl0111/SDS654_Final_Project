@@ -497,3 +497,79 @@ FPR <- FP / (FP + TN)  # false positive rate
 TPR
 FPR
 ```
+
+```{r jagsglm}
+model_hier_glm <- "
+model {
+  # likelihood (GLM form)
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- inprod(X[i,], beta_eff[]) + b[id[i]]
+  }
+
+  # priors and feature selection
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0.0, 1.0E-4)
+    z[j] ~ dbern(0.5)
+    beta_eff[j] <- z[j] * beta[j]
+  }
+
+  # random effects
+  for (k in 1:n_id) {
+    b[k] ~ dnorm(0.0, tau_b)
+  }
+
+  # hyperprior
+  tau_b ~ dgamma(0.001, 0.001)
+  sigma_b <- 1 / sqrt(tau_b)
+}
+"
+```
+
+```{r JAGSrunglm}
+library(rjags)
+t_jags_glm <- system.time({
+  jm_glm <- jags.model(textConnection(model_hier_glm), data = list(N = nrow(X), P = ncol(X), y=y, X=X, id=id, n_id=n_id))
+  update(jm_glm, 5000) # burnin
+  cs_glm <- coda.samples(jm_glm, c('beta', 'z', 'sigma_b'), 10000)
+  s_glm <- as.data.frame(cs_glm[[1]])
+})
+
+t_jags_glm["elapsed"]
+
+beta_jags_glm <- s_glm[, 1:20]
+Z_jags_glm <- s_glm[, 21:40]
+beta_eff_jags_glm <- beta_jags_glm * Z_jags_glm
+```
+
+```{r JAGSevalationglm, fig.width = 6, fig.height = 6}
+# compute the effective sample size
+ess_beta_jags_glm <- effectiveSize(as.mcmc(beta_jags_glm))
+hist(ess_beta_jags_glm, breaks = 20, main = "ESS for beta by JAGS glm", xlab = "ESS")
+
+# compute 95% credible interval of beta
+CI_beta_jags_glm <- apply(beta_eff_jags_glm, 2, quantile, c(0.025, 0.975))
+in_CI_beta_jags_glm <- (beta_true >= CI_beta_jags_glm[1, ]) & (beta_true <= CI_beta_jags_glm[2, ])
+mean(in_CI_beta_jags_glm)  # coverage of beta
+
+# compute 95% credible interval coverage for sigma
+CI_sigma_jags_glm <- quantile(s[,41], c(0.025, 0.975))
+in_CI_sigma_jags_glm <- (sigma_b_true >= CI_sigma_jags_glm[1]) & (sigma_b_true <= CI_sigma_jags_glm[2])
+in_CI_sigma_jags_glm
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_jags_glm)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
+```

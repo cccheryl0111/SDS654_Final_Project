@@ -400,3 +400,69 @@ TPR
 FPR
 ```
 
+apply glm module in JAGS
+```{r JAGSglm}
+model_glm <- "
+model {
+  # likelihood (GLM form)
+  for (i in 1:N) {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- inprod(X[i,], beta_eff[])
+  }
+
+  # priors and feature selection
+  for (j in 1:P) {
+    beta[j] ~ dnorm(0.0, 1.0E-4)
+    z[j] ~ dbern(0.5)
+    beta_eff[j] <- z[j] * beta[j]
+  }
+}
+"
+```
+
+```{r jagsrunglm}
+library(rjags)
+load.module("glm")
+t_jags_glm <- system.time({
+  jm_glm <- jags.model(
+    textConnection(model_glm),
+    data = list(N = nrow(X), P = ncol(X), y = y, X = X)
+  )
+  update(jm_glm, 5000)
+  cs_glm <- coda.samples(jm_glm, c("beta", "z"), 10000)
+  s_glm <- as.data.frame(cs_glm[[1]])
+})
+
+t_jags_glm["elapsed"]
+
+beta_jags_glm <- s_glm[, 1:20]
+Z_jags_glm <- s_glm[, 21:40]
+beta_eff_jags_glm <- beta_jags_glm * Z_jags_glm
+```
+
+```{r JAGSevaluationglm, fig.width = 6, fig.height = 6}
+# compute the effective sample size
+ess_beta_jags_glm <- effectiveSize(as.mcmc(beta_jags_glm))
+hist(ess_beta_jags_glm, breaks=20, main = "ESS for beta by JAGS glm", xlab = "ESS")
+
+# compute 95% credible interval of beta
+CI_beta_jags_glm <- apply(beta_eff_jags_glm, 2, quantile, c(0.025, 0.975))
+in_CI_beta_jags_glm <- (beta_true >= CI_beta_jags_glm[1, ]) & (beta_true <= CI_beta_jags_glm[2, ])
+mean(in_CI_beta_jags_glm)  # coverage of beta
+
+# compute evaluation of selcetion
+pip <- colMeans(Z_jags_glm)
+
+selected <- as.integer(pip > 0.5)
+
+TP <- sum(selected == 1 & Z_true == 1)
+FP <- sum(selected == 1 & Z_true == 0)
+TN <- sum(selected == 0 & Z_true == 0)
+FN <- sum(selected == 0 & Z_true == 1)
+
+TPR <- TP / (TP + FN)  # true positive rate
+FPR <- FP / (FP + TN)  # false positive rate
+
+TPR
+FPR
+```
